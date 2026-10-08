@@ -297,7 +297,7 @@ private struct DetectorStatusSection: View {
         } header: {
             Text("Detector")
         } footer: {
-            Text("The detector is trained on COCO, which has no class for a router, access point, printer, switch, NAS or server — so it will not find most of what the Wi-Fi tab does. Reading model numbers and asset tags off the hardware is the pass that carries this feature, and it runs regardless.")
+            Text("Only electrical equipment is reported — screens, computers, keyboards, mice, phones, remotes and appliances. Furniture and everything else the detector can see is ignored. The detector is trained on COCO, which has no class for a router, access point, printer, switch, NAS or server, so it will not find most of what the Wi-Fi tab does; reading model numbers and asset tags off the hardware is the pass that carries those, and it runs regardless.")
         }
     }
 }
@@ -333,8 +333,13 @@ private struct ResultsSection: View {
                 }
             } footer: {
                 VStack(alignment: .leading, spacing: 4) {
-                    let relevant = capture.inventoryAssets.count
-                    Text(verbatim: "\(relevant) of \(capture.assets.count) are things an asset register would carry; the rest are furniture and context.")
+                    // Everything kept is electrical equipment; the only other
+                    // rows are asset tags read with no recognised object
+                    // around them.
+                    let tags = capture.assets.count - capture.inventoryAssets.count
+                    Text(verbatim: tags == 0
+                         ? "Only electrical equipment is listed; furniture and other objects are ignored."
+                         : "\(tags) \(tags == 1 ? "is an asset tag" : "are asset tags") read with no recognised object around \(tags == 1 ? "it" : "them").")
                     if peopleCount > 0 {
                         Text(verbatim: "\(peopleCount) \(peopleCount == 1 ? "person was" : "people were") detected and deliberately not recorded.")
                     }

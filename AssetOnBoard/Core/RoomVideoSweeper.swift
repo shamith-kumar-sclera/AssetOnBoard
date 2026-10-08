@@ -13,19 +13,20 @@
 //  The hard part is not detection but counting. One printer visible for twelve
 //  seconds is roughly forty frames; a register wants one row. So detections are
 //  not collected, they are *tracked*: each is matched against an object already
-//  being followed, and only unmatched detections open a new track. Matching runs
-//  strongest-evidence-first:
+//  being followed, and only unmatched detections open a new track. How that
+//  matching is decided lives in AssetTrackingEngine, which has no ARKit in it
+//  and can be tested. What lives here is everything that needs the device:
 //
-//    1. A shared barcode. An asset tag is an identity, so it re-joins a track
-//       even after the camera has looked away and come back.
-//    2. Overlap with a track's last known box, for the same class. This is what
-//       carries a slow pan, where an object drifts a little between frames.
-//
-//  Nothing here merges two *different* objects: two laptops side by side hold
-//  separate boxes and stay separate tracks. The cost of that choice is the
-//  opposite error — pan away from a desk and back, and an untagged object with
-//  no legible text may open a second track. Barcodes and model numbers close
-//  that gap, and they are what the register wants anyway.
+//    · ARKit's world tracking, which is what makes "the same place" mean
+//      something. The camera's pose is known in one coordinate frame for the
+//      whole sweep, so a detection can be pinned to a point in the room and,
+//      when the camera comes back, asked whether it is looking at that point.
+//    · Placement. A box in the picture is a direction, not a position; the
+//      depth has to come from somewhere. Without LiDAR that is a raycast onto
+//      a surface ARKit has estimated, or the feature points it has mapped in
+//      that part of the view — gathered across frames, because any one frame
+//      has too few.
+//    · Vision, running the detector and the text and barcode readers.
 //
 //  Keeping the viewfinder smooth while all that runs takes four things, and
 //  losing any one of them brings the stutter back:
@@ -36,8 +37,10 @@
 //    · Text recognition runs on a slower cadence than object detection. Reading
 //      a label costs several times what finding a box does, and a model number
 //      does not need re-reading four times a second.
-//    · The next pass is timed from when the last one *finished*, so a busy
-//      device backs off by itself instead of queueing work it cannot catch up on.
+//    · One analysis pass runs at a time. A frame that arrives while one is in
+//      flight is skipped rather than queued, so a device slower than the
+//      interval backs off by itself instead of queueing work it cannot catch
+//      up on.
 //    · The track list is not observable. Republishing a few hundred tracks to
 //      SwiftUI several times a second cost more than the detection did.
 //
@@ -45,6 +48,7 @@
 import Foundation
 import ARKit
 import AVFoundation
+import Combine
 import RealityKit
 import Vision
 import Observation
@@ -113,6 +117,20 @@ final class RoomVideoSweeper {
     /// Confirmed tracks the raycast could not place in the room.
     private(set) var unplacedCount = 0
     private(set) var relocalization: Relocalization = .notRequested
+    /// Published so the overlay can map boxes onto the right aspect.
+    private(set) var deviceOrientation: SweepOrientation = .portrait
+    /// False when no Core ML model loaded, so only text and barcodes run.
+    private(set) var hasDetector = false
+    /// True while ARKit cannot vouch for the camera's pose — the first second
+    /// or two, a fast pan, a blank wall. Nothing is pinned until it can.
+    private(set) var trackingLimited = false
+
+    /// Prints what the sweep is actually doing, for a device console.
+    ///
+    /// A sweep fails silently by nature: the viewfinder looks identical whether
+    /// frames are flowing, the detector is finding things, or the raycasts are
+    /// landing. These counters separate those three.
+    @ObservationIgnored var diagnostics = SweepDiagnostics()
 
     /// The tracking core, deliberately free of ARKit so it can be tested.
     @ObservationIgnored private(set) var engine = AssetTrackingEngine()
@@ -130,8 +148,6 @@ final class RoomVideoSweeper {
 
     var newCount: Int { engine.newAssets.count }
 
-    // MARK: - Tuning
-
     // MARK: - Capture
 
     /// Renders the camera and owns the ARKit session.
@@ -148,16 +164,22 @@ final class RoomVideoSweeper {
     /// Where Vision actually runs.
     private let analysisQueue = DispatchQueue(label: "com.sclera.assetonboard.sweep.vision",
                                               qos: .userInitiated)
-    private var relay: FrameRelay?
+    /// Per-frame hook. RealityKit owns the ARSession delegate, so this is the
+    /// supported way to do work on every frame.
+    private var frameSubscription: AnyCancellable?
     private var context: SweepContext?
+
+    init() {
+        // Before the view ever reaches a window: otherwise RealityKit runs a
+        // default session of its own first and reconfigures ours — discarding
+        // `initialWorldMap`, so nothing relocalises.
+        arView.automaticallyConfigureSession = false
+    }
 
     // MARK: - Lifecycle
 
     /// Opens the camera and begins sweeping.
     ///
-    /// - Parameter detector: the Core ML model RoomScanner already loaded,
-    ///   shared rather than loaded a second time. The text and barcode passes
-    ///   run with or without it.
     /// - Parameters:
     ///   - detector: the Core ML model RoomScanner already loaded, shared rather
     ///     than loaded a second time. Text and barcodes run with or without it.
@@ -181,6 +203,7 @@ final class RoomVideoSweeper {
         trackedCount = 0
         knownCount = 0
         unplacedCount = 0
+        trackingLimited = false
         knownAssets = known
         relocalization = worldMap == nil ? .notRequested : .searching
 
@@ -195,10 +218,18 @@ final class RoomVideoSweeper {
 
         let context = SweepContext(detector: detector, threshold: confidenceThreshold)
         self.context = context
+        hasDetector = detector != nil
+        diagnostics = SweepDiagnostics()
+        diagnostics.begin(hasDetector: detector != nil,
+                          knownAssets: known.count,
+                          relocalising: worldMap != nil)
+
+        arView.automaticallyConfigureSession = false
 
         let configuration = ARWorldTrackingConfiguration()
-        // Planes are what a raycast lands on; without them a detection has no
-        // surface to be placed against and stays unplaced.
+        // Detected planes are what `.existingPlaneGeometry` raycasts land on;
+        // `.estimatedPlane` fits its own to the feature points around the ray.
+        // Placement tries both, so both are worth having.
         configuration.planeDetection = [.horizontal, .vertical]
         configuration.environmentTexturing = .none
         // On a LiDAR device the mesh gives far better placement than estimated
@@ -208,33 +239,82 @@ final class RoomVideoSweeper {
         }
         if let worldMap { configuration.initialWorldMap = worldMap }
 
-        // The session and the analysis context are captured here, on the main
-        // actor, so the per-frame callback never has to reach back for them.
-        let sessionRef = self.session
-        let analysisQueue = self.analysisQueue
-        let relay = FrameRelay { [weak self] frame in
-            guard let self else { return }
-            let tracking = frame.camera.trackingState
-            Task { @MainActor in self.noteTracking(tracking) }
+        session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
 
-            guard let job = context.claim(now: Date()) else { return }
-            // Ownership of the frame passes to the analysis queue: the delegate
-            // has returned by then, and `claim` allows one pass at a time.
-            let captured = frame
-            nonisolated(unsafe) let session = sessionRef
+        // Frames come from RealityKit's scene update, not from ARSessionDelegate.
+        //
+        // ARView installs itself as the session's delegate and relies on being
+        // it. Taking that over looks like it works — the camera still renders —
+        // but the callback never fires, so nothing is ever analysed and the
+        // sweep silently finds nothing. `SceneEvents.Update` is the supported
+        // per-frame hook and leaves ARView's own delegate alone.
+        let analysisQueue = self.analysisQueue
+        nonisolated(unsafe) let session = self.session
+        frameSubscription = AnyCancellable(
+            arView.scene.subscribe(to: SceneEvents.Update.self) { [weak self] _ in
+            guard let self, let frame = session.currentFrame else { return }
+            let now = Date()
+            let tracking = frame.camera.trackingState
+            let limited: Bool
+            if case .normal = tracking { limited = false } else { limited = true }
+            Task { @MainActor in
+                self.diagnostics.framesReceived += 1
+                if limited { self.diagnostics.limitedFrames += 1 }
+                self.noteTracking(tracking)
+            }
+
+            // Feature points are gathered from every frame, not only the ones
+            // analysed. Any one frame has a few hundred, scattered; a box on a
+            // monitor often holds fewer than the three a placement needs. Three
+            // seconds of them is a cloud dense enough to land on. They are in
+            // world space, so frames pile up without any bookkeeping.
+            if !limited, let cloud = frame.rawFeaturePoints {
+                context.accumulate(points: cloud.points, identifiers: cloud.identifiers, at: now)
+            }
+
+            guard let job = context.claim(now: now) else { return }
+
+            // The frame must not leave this callback. ARKit hands out buffers
+            // from a small pool, and holding one across the few hundred
+            // milliseconds Vision takes starves the capture pipeline until the
+            // camera stalls — which looks exactly like detecting the first
+            // frame and then freezing. So: copy the image, take the camera as
+            // plain numbers, and let the frame go.
+            guard let image = Self.copy(frame.capturedImage) else {
+                context.release(job, finishedAt: Date())
+                return
+            }
+            let snapshot = CameraSnapshot(transform: frame.camera.transform,
+                                          intrinsics: frame.camera.intrinsics,
+                                          resolution: frame.camera.imageResolution)
+            let features = limited ? [] : context.featurePoints(at: now)
+            nonisolated(unsafe) let buffer = image
             analysisQueue.async {
-                let detected = context.analyse(captured.capturedImage, job: job)
-                let placed = Self.place(detected, in: captured, using: session)
+                let detected = context.analyse(buffer, job: job)
+                var placed = Self.place(detected, from: snapshot, features: features,
+                                        using: session, orientation: job.orientation,
+                                        trackingLimited: limited)
+                placed.timestamp = now
+                // Free the slot before hopping back. Without this the sweep
+                // claims once and never again: every later frame is refused,
+                // so nothing reaches a second sighting and nothing is ever
+                // confirmed — one frame of boxes, then a dead viewfinder.
+                context.release(job, finishedAt: Date())
                 Task { @MainActor in self.absorb(placed) }
             }
-        }
-        self.relay = relay
-        session.delegate = relay
-        session.delegateQueue = captureQueue
-        session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
+        })
 
         startedAt = Date()
         state = .sweeping
+    }
+
+    /// Tells the sweep how the device is being held.
+    ///
+    /// Called as the interface rotates. Everything downstream depends on it:
+    /// what Vision is shown, and where in the room a detection is pinned.
+    func update(orientation: SweepOrientation) {
+        context?.orientation = orientation
+        if deviceOrientation != orientation { deviceOrientation = orientation }
     }
 
     /// Asks ARKit for the map of what has been seen so far.
@@ -251,6 +331,8 @@ final class RoomVideoSweeper {
     /// Ends the sweep and returns what it confirmed.
     @discardableResult
     func stop() -> [DetectedAsset] {
+        frameSubscription?.cancel()
+        frameSubscription = nil
         session.pause()
         if state.isActive { state = .finished }
         return confirmedAssets
@@ -269,37 +351,128 @@ final class RoomVideoSweeper {
         knownAssets = []
         knownCount = 0
         unplacedCount = 0
+        trackingLimited = false
         relocalization = .notRequested
         state = .idle
     }
 
     // MARK: - Frames
 
-    /// Raycasts each detection onto real geometry to get a world position.
+    /// Works out where in the room each detection is.
     ///
     /// The query is built from the frame the detection actually came from, not
     /// from wherever the camera is by the time analysis finishes — a pan during
     /// those few hundred milliseconds would otherwise throw the ray far enough
     /// off to matter at a half-metre matching radius.
+    ///
+    /// Nothing is placed while tracking is limited. ARKit says the pose then
+    /// "may not be accurate or consistent", and a pin at a wrong position is
+    /// worse than no pin: it is a duplicate waiting to happen.
     nonisolated private static func place(_ frame: FrameDetections,
-                                          in arFrame: ARFrame,
-                                          using session: ARSession) -> FrameDetections {
+                                          from camera: CameraSnapshot,
+                                          features: [SIMD3<Float>],
+                                          using session: ARSession,
+                                          orientation: SweepOrientation,
+                                          trackingLimited: Bool) -> FrameDetections {
         var placed = frame
+        placed.camera = camera
+        placed.orientation = orientation
+        placed.trackingLimited = trackingLimited
+        guard !trackingLimited else { return placed }
+
         for index in placed.objects.indices {
-            let point = AssetTrackingEngine.imagePoint(forVisionBox: placed.objects[index].box)
-            // Existing geometry first: on a LiDAR device that is the mesh, which
-            // is accurate. Estimated planes are the fallback everywhere else.
-            let query = arFrame.raycastQuery(from: point,
-                                             allowing: .estimatedPlane,
-                                             alignment: .any)
-            guard let result = session.raycast(query).first else { continue }
-            let t = result.worldTransform.columns.3
-            placed.objects[index].worldPosition = SIMD3<Float>(t.x, t.y, t.z)
+            let box = placed.objects[index].box
+            placed.raycastsFired += 1
+
+            // 1. Raycasts onto real geometry, where there is any. Five rays
+            //    rather than one, because the one through the centre of a
+            //    chair goes through the gap in its back and lands on the wall;
+            //    the engine then picks the hit worth believing. On a device
+            //    without LiDAR a ray only lands where ARKit has estimated a
+            //    plane or detected one — pointed at a desk from close range,
+            //    that is often nowhere.
+            var hits: [SIMD3<Float>] = []
+            for point in AssetTrackingEngine.raycastPoints(forVisionBox: box, orientation: orientation) {
+                // The ray is built from the pose of the frame the detection came
+                // from, not from wherever the camera is now, so a pan during
+                // analysis does not drag the pin with it.
+                let ray = camera.ray(through: point)
+                for target in [ARRaycastQuery.Target.estimatedPlane, .existingPlaneGeometry] {
+                    let query = ARRaycastQuery(origin: ray.origin,
+                                               direction: ray.direction,
+                                               allowing: target,
+                                               alignment: .any)
+                    guard let result = session.raycast(query).first else { continue }
+                    let t = result.worldTransform.columns.3
+                    hits.append(SIMD3<Float>(t.x, t.y, t.z))
+                    break
+                }
+            }
+            let distances = hits.map { simd_distance($0, camera.position) }
+            if let chosen = AssetTrackingEngine.representativeIndex(ofDistances: distances) {
+                placed.objects[index].worldPosition = hits[chosen]
+                placed.raycastsHit += 1
+                continue
+            }
+
+            // 2. Otherwise the feature points inside the detection's box. They
+            //    exist wherever there is visible texture, which is most of a
+            //    room and nearly all of the hardware worth onboarding.
+            let rect = AssetTrackingEngine.imageRect(forVisionBox: box, orientation: orientation)
+            guard let position = AssetTrackingEngine.position(forImageRect: rect,
+                                                              featurePoints: features,
+                                                              camera: camera)
+            else { continue }
+            placed.objects[index].worldPosition = position
+            placed.featurePlacements += 1
         }
         return placed
     }
 
+    /// Copies a frame's image so the frame itself can be released at once.
+    ///
+    /// ARKit's buffers are bi-planar YUV; both planes are copied row by row
+    /// because the source stride is not necessarily the destination's.
+    nonisolated private static func copy(_ source: CVPixelBuffer) -> CVPixelBuffer? {
+        let width = CVPixelBufferGetWidth(source)
+        let height = CVPixelBufferGetHeight(source)
+        let format = CVPixelBufferGetPixelFormatType(source)
+
+        var destination: CVPixelBuffer?
+        let attributes = [kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary] as CFDictionary
+        guard CVPixelBufferCreate(nil, width, height, format, attributes, &destination) == kCVReturnSuccess,
+              let destination else { return nil }
+
+        CVPixelBufferLockBaseAddress(source, .readOnly)
+        CVPixelBufferLockBaseAddress(destination, [])
+        defer {
+            CVPixelBufferUnlockBaseAddress(destination, [])
+            CVPixelBufferUnlockBaseAddress(source, .readOnly)
+        }
+
+        let planes = max(CVPixelBufferGetPlaneCount(source), 1)
+        for plane in 0..<planes {
+            guard let from = CVPixelBufferGetBaseAddressOfPlane(source, plane),
+                  let into = CVPixelBufferGetBaseAddressOfPlane(destination, plane)
+            else { return nil }
+            let fromStride = CVPixelBufferGetBytesPerRowOfPlane(source, plane)
+            let intoStride = CVPixelBufferGetBytesPerRowOfPlane(destination, plane)
+            let rows = CVPixelBufferGetHeightOfPlane(source, plane)
+            let bytes = min(fromStride, intoStride)
+            for row in 0..<rows {
+                memcpy(into.advanced(by: row * intoStride),
+                       from.advanced(by: row * fromStride),
+                       bytes)
+            }
+        }
+        return destination
+    }
+
     private func noteTracking(_ tracking: ARCamera.TrackingState) {
+        let limited: Bool
+        if case .normal = tracking { limited = false } else { limited = true }
+        if limited != trackingLimited { trackingLimited = limited }
+
         guard relocalization != .notRequested else { return }
         switch tracking {
         case .normal:
@@ -321,8 +494,8 @@ final class RoomVideoSweeper {
         // frame that has nothing to do with the one the register was written
         // in, and matching against it would pair assets by coincidence.
         let visible = engine.absorb(frame,
-                                    knownAssets: relocalization == .located ? knownAssets : [],
-                                    at: Date())
+                                    knownAssets: relocalization == .located ? knownAssets : [])
+        diagnostics.record(frame, counts: engine.counts, relocalization: relocalization)
         publish(visible: visible)
     }
 
@@ -351,6 +524,12 @@ nonisolated private struct AnalysisJob: Sendable {
     /// a label costs several times what finding a box does, and a model number
     /// does not need re-reading four times a second.
     let includesText: Bool
+    /// How the device was held when the pass was claimed. Read once, so Vision
+    /// and placement agree even if the interface rotates mid-pass.
+    let orientation: SweepOrientation
+    /// Identifies this claim, so a pass declared stuck and superseded cannot
+    /// release the slot its successor now holds.
+    let token: Int
 }
 
 /// Everything the capture and analysis queues need, fixed for one sweep.
@@ -363,10 +542,28 @@ nonisolated private final class SweepContext: @unchecked Sendable {
     /// Gap between text and barcode passes.
     private let textInterval: TimeInterval = 0.8
 
+    /// How long a pass may hold the slot before it is assumed dead.
+    ///
+    /// Belt and braces: forgetting to release once cost a whole sweep, and the
+    /// symptom — a viewfinder that looks alive but analyses nothing — gives no
+    /// hint of the cause.
+    private let stuckTimeout: TimeInterval = 5
+
     private let lock = NSLock()
     private var busy = false
+    private var claimedAt = Date.distantPast
+    private var currentToken = 0
     private var lastObjectPass = Date.distantPast
     private var lastTextPass = Date.distantPast
+    private var heldOrientation: SweepOrientation = .portrait
+    private var cloud = FeatureCloud()
+
+    /// How the device is held. Read on the analysis queue, written from the
+    /// main actor when the interface rotates.
+    var orientation: SweepOrientation {
+        get { lock.withLock { heldOrientation } }
+        set { lock.withLock { heldOrientation = newValue } }
+    }
 
     private let threshold: Double
     private let objectRequest: VNCoreMLRequest?
@@ -390,6 +587,19 @@ nonisolated private final class SweepContext: @unchecked Sendable {
         barcodeRequest = VNDetectBarcodesRequest()
     }
 
+    // MARK: Feature cloud
+
+    func accumulate(points: [SIMD3<Float>], identifiers: [UInt64], at now: Date) {
+        lock.withLock { cloud.add(points: points, identifiers: identifiers, at: now) }
+    }
+
+    /// A snapshot of the recent cloud, for one placement pass.
+    func featurePoints(at now: Date) -> [SIMD3<Float>] {
+        lock.withLock { cloud.points(at: now) }
+    }
+
+    // MARK: Slot
+
     /// Claims the analysis slot when a pass is due, describing what to run.
     ///
     /// Returns nil while one is already in flight, so a device slower than the
@@ -397,21 +607,32 @@ nonisolated private final class SweepContext: @unchecked Sendable {
     /// catch up on.
     func claim(now: Date) -> AnalysisJob? {
         lock.withLock {
+            if busy, now.timeIntervalSince(claimedAt) > stuckTimeout { busy = false }
             guard !busy, now.timeIntervalSince(lastObjectPass) >= objectInterval else { return nil }
             busy = true
+            claimedAt = now
+            currentToken += 1
             let includesText = now.timeIntervalSince(lastTextPass) >= textInterval
             if includesText { lastTextPass = now }
-            return AnalysisJob(includesText: includesText)
+            return AnalysisJob(includesText: includesText,
+                               orientation: heldOrientation,
+                               token: currentToken)
         }
     }
 
     /// Frees the slot, timing the next pass from when this one *ended*.
-    func release(finishedAt: Date) {
+    ///
+    /// A pass that was written off as stuck and then finishes after all must
+    /// not free a slot that now belongs to its successor.
+    func release(_ job: AnalysisJob, finishedAt: Date) {
         lock.withLock {
+            guard job.token == currentToken else { return }
             busy = false
             lastObjectPass = finishedAt
         }
     }
+
+    // MARK: Vision
 
     /// Runs the due passes on one frame and returns plain values.
     ///
@@ -419,7 +640,9 @@ nonisolated private final class SweepContext: @unchecked Sendable {
     /// cross back to the main actor — only the structs built here do.
     func analyse(_ buffer: CVPixelBuffer, job: AnalysisJob) -> FrameDetections {
         var result = FrameDetections()
-        let handler = VNImageRequestHandler(cvPixelBuffer: buffer, orientation: .up, options: [:])
+        let handler = VNImageRequestHandler(cvPixelBuffer: buffer,
+                                            orientation: job.orientation.exif,
+                                            options: [:])
 
         var requests: [VNRequest] = []
         if let objectRequest { requests.append(objectRequest) }
@@ -431,6 +654,7 @@ nonisolated private final class SweepContext: @unchecked Sendable {
         try? handler.perform(requests)
 
         if let observations = objectRequest?.results as? [VNRecognizedObjectObservation] {
+            var objects: [ObjectDetection] = []
             for observation in observations {
                 guard let top = observation.labels.first,
                       Double(top.confidence) >= threshold else { continue }
@@ -438,12 +662,34 @@ nonisolated private final class SweepContext: @unchecked Sendable {
                     result.people += 1
                     continue
                 }
-                result.objects.append(ObjectDetection(
-                    label: COCOAssetCatalog.displayName(for: top.identifier),
+                // Only electrical equipment is inventoried. A chair or a
+                // bottle is dropped here, before it can open a track or
+                // draw a box.
+                guard COCOAssetCatalog.isElectrical(top.identifier) else { continue }
+                let name = COCOAssetCatalog.displayName(for: top.identifier)
+                // Runner-up classes nearly as likely as the winner ride along.
+                // A desk monitor is "tv" in one frame and "laptop" in the next;
+                // the engine uses these to see that as one object, not two.
+                // Labels arrive strongest first, so the first three electrical
+                // ones above the bar are the ones worth carrying.
+                var alternates: [String] = []
+                for label in observation.labels.dropFirst()
+                where Double(label.confidence) >= 0.4 * Double(top.confidence) {
+                    guard COCOAssetCatalog.isElectrical(label.identifier) else { continue }
+                    let other = COCOAssetCatalog.displayName(for: label.identifier)
+                    if other != name, !alternates.contains(other) { alternates.append(other) }
+                    if alternates.count == 3 { break }
+                }
+                objects.append(ObjectDetection(
+                    label: name,
                     category: COCOAssetCatalog.category(for: top.identifier) ?? .other,
                     confidence: Double(top.confidence),
-                    box: observation.boundingBox))
+                    box: observation.boundingBox,
+                    alternateLabels: alternates))
             }
+            // The model suppresses duplicate boxes within a class, not across
+            // classes: one screen can come back as both "tv" and "laptop".
+            result.objects = AssetTrackingEngine.suppressDuplicates(objects)
         }
 
         guard job.includesText else { return result }
@@ -469,15 +715,91 @@ nonisolated private final class SweepContext: @unchecked Sendable {
     }
 }
 
-/// Forwards ARKit frames without dragging actor isolation onto the delegate.
-nonisolated private final class FrameRelay: NSObject, ARSessionDelegate, @unchecked Sendable {
-    private let onFrame: @Sendable (ARFrame) -> Void
+// MARK: - Diagnostics
 
-    init(onFrame: @escaping @Sendable (ARFrame) -> Void) {
-        self.onFrame = onFrame
+/// Counters printed periodically while a sweep runs.
+///
+/// Debug builds only: this exists to make a device console answer "where did it
+/// stop?" without a debugger attached.
+@MainActor
+struct SweepDiagnostics {
+    var framesReceived = 0
+    /// Frames ARKit delivered while unable to vouch for the pose.
+    var limitedFrames = 0
+    private var passes = 0
+    private var objects = 0
+    private var texts = 0
+    private var barcodes = 0
+    private var raycastsFired = 0
+    private var raycastsHit = 0
+    private var featurePlacements = 0
+    private var limitedPasses = 0
+    private var lastReport = Date.distantPast
+    private var labels: [String: Int] = [:]
+
+    mutating func begin(hasDetector: Bool, knownAssets: Int, relocalising: Bool) {
+        Self.startLog()
+        report("sweep start · detector=\(hasDetector ? "yes" : "NONE") "
+               + "· known=\(knownAssets) · relocalising=\(relocalising)")
+        lastReport = Date()
     }
 
-    func session(_ session: ARSession, didUpdate frame: ARFrame) {
-        onFrame(frame)
+    mutating func record(_ frame: FrameDetections,
+                         counts: (confirmed: Int, tracked: Int, known: Int, unplaced: Int),
+                         relocalization: RoomVideoSweeper.Relocalization) {
+        passes += 1
+        objects += frame.objects.count
+        texts += frame.texts.count
+        barcodes += frame.barcodes.count
+        raycastsFired += frame.raycastsFired
+        raycastsHit += frame.raycastsHit
+        featurePlacements += frame.featurePlacements
+        if frame.trackingLimited { limitedPasses += 1 }
+        for object in frame.objects { labels[object.label, default: 0] += 1 }
+
+        guard Date().timeIntervalSince(lastReport) >= 2 else { return }
+        lastReport = Date()
+        let top = labels.sorted { $0.value > $1.value }.prefix(4)
+            .map { "\($0.key)×\($0.value)" }.joined(separator: " ")
+        report("frames=\(framesReceived) passes=\(passes) objects=\(objects) "
+               + "text=\(texts) codes=\(barcodes) "
+               + "raycast=\(raycastsHit)/\(raycastsFired) features=\(featurePlacements) "
+               + "limited=\(limitedFrames)f/\(limitedPasses)p "
+               + "tracks=\(counts.tracked) confirmed=\(counts.confirmed) unplaced=\(counts.unplaced) "
+               + "reloc=\(relocalization) \(top.isEmpty ? "" : "· " + top)")
+    }
+
+    private func report(_ message: String) {
+        #if DEBUG
+        let line = "[sweep] \(message)"
+        print(line)
+        // Also kept on disk: a device console only shows what was streaming at
+        // the time, and the interesting part of a sweep happens while nobody is
+        // watching a terminal. Pull it with Tools/pull-sweep-log.sh.
+        SweepDiagnostics.append(line)
+        #endif
+    }
+
+    /// Where the sweep log lands inside the app container.
+    static var logURL: URL {
+        URL.documentsDirectory.appendingPathComponent("sweep-log.txt")
+    }
+
+    static func startLog() {
+        #if DEBUG
+        try? "sweep log \(Date().formatted(date: .abbreviated, time: .standard))\n"
+            .write(to: logURL, atomically: true, encoding: .utf8)
+        #endif
+    }
+
+    private static func append(_ line: String) {
+        guard let data = (line + "\n").data(using: .utf8) else { return }
+        if let handle = try? FileHandle(forWritingTo: logURL) {
+            defer { try? handle.close() }
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: data)
+        } else {
+            try? data.write(to: logURL)
+        }
     }
 }

@@ -29,6 +29,16 @@
 			path = AssetOnBoard;
 			sourceTree = "<group>";
 		};
+		6DAA00000000000000000001 /* Tests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = Tests;
+			sourceTree = "<group>";
+		};
+		6DAA00000000000000000002 /* Tools */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = Tools;
+			sourceTree = "<group>";
+		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -46,6 +56,8 @@
 			isa = PBXGroup;
 			children = (
 				6D11426C3049785700869FB7 /* AssetOnBoard */,
+				6DAA00000000000000000001 /* Tests */,
+				6DAA00000000000000000002 /* Tools */,
 				6D11426B3049785700869FB7 /* Products */,
 			);
 			sourceTree = "<group>";

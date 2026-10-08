@@ -63,14 +63,26 @@ nonisolated enum AssetCategory: String, Sendable, Codable, CaseIterable, Identif
         }
     }
 
-    /// Whether this is something an IT asset register would actually carry.
+    /// Whether this is something the asset register carries.
     ///
-    /// Furniture is detected and shown because it helps a human recognise the
-    /// room, but it is not what the export is for.
+    /// Appliances count: a microwave or a fridge is electrical equipment the
+    /// estate owns, even though no network tab will ever find it.
     var isInventoryRelevant: Bool {
         switch self {
-        case .display, .computer, .peripheral, .phone, .networkGear, .printer: true
-        case .appliance, .furniture, .other: false
+        case .display, .computer, .peripheral, .phone, .networkGear, .printer, .appliance: true
+        case .furniture, .other: false
+        }
+    }
+
+    /// Whether the detector should report this at all.
+    ///
+    /// The sweep inventories electrical equipment. Furniture, plants, bottles
+    /// and the rest of what a COCO model can see are dropped before they
+    /// reach the tracker, so they neither count nor draw a box.
+    var isElectrical: Bool {
+        switch self {
+        case .display, .computer, .peripheral, .phone, .networkGear, .printer, .appliance: true
+        case .furniture, .other: false
         }
     }
 }

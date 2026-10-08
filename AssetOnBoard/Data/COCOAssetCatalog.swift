@@ -16,6 +16,11 @@
 //  Both vocabularies are kept here: the app loads whichever model is present,
 //  and a COCO model still works with the classes it does have.
 //
+//  Only electrical classes are reported. The furniture and household rows stay
+//  in the table so a class can still be named, but `isElectrical` is what the
+//  sweep and the photo pass consult before a detection is allowed to exist,
+//  and a chair never passes it.
+//
 
 import Foundation
 
@@ -62,12 +67,16 @@ nonisolated enum COCOAssetCatalog {
         "remote": .peripheral,
         "cell phone": .phone,
 
-        // Context, useful for recognising the room, not for the register.
+        // Electrical, so inventoried, even if nothing on the network answers
+        // for them.
         "microwave": .appliance,
         "oven": .appliance,
         "toaster": .appliance,
         "refrigerator": .appliance,
-        "sink": .appliance,
+        "hair drier": .appliance,
+
+        // Known so they can be named; never reported, because not electrical.
+        "sink": .furniture,
         "chair": .furniture,
         "couch": .furniture,
         "bed": .furniture,
@@ -106,6 +115,15 @@ nonisolated enum COCOAssetCatalog {
 
     static func category(for label: String) -> AssetCategory? {
         mapping[label.lowercased()]
+    }
+
+    /// Whether a detector class is something the sweep reports at all.
+    ///
+    /// The single gate for both the video sweep and the photo pass: a class
+    /// that is not electrical equipment is dropped before it can open a track
+    /// or draw a box. Unknown classes are not electrical.
+    static func isElectrical(_ label: String) -> Bool {
+        category(for: label)?.isElectrical == true
     }
 
     /// True for a class worth showing at all.

@@ -94,10 +94,10 @@ final class RoomScanner {
 
     /// Names to look for in the bundle, best first.
     ///
-    /// `AssetDetector` is the open-vocabulary export whose classes are the
-    /// hardware this app inventories; a COCO model is the fallback, and finds
-    /// laptops and screens but no printer, router, switch or access point.
-    private static let candidateModelNames = ["AssetDetector", "yolo11m", "yolov8m", "yolo11s", "yolov8s"]
+    /// Plain YOLO. It knows the 80 COCO classes — laptops, screens, keyboards,
+    /// phones, chairs — and nothing beyond them, so a printer or an access point
+    /// is invisible to it and the text pass is what carries those.
+    private static let candidateModelNames = ["yolo11m", "yolov8m", "yolo11s", "yolov8s"]
 
     // MARK: - Model loading
 
@@ -167,6 +167,9 @@ final class RoomScanner {
                         people += 1
                         continue
                     }
+                    // The same gate the sweep applies: furniture and the rest
+                    // of what COCO can see are not assets and are not kept.
+                    guard COCOAssetCatalog.isElectrical(top.identifier) else { continue }
                     let category = COCOAssetCatalog.category(for: top.identifier) ?? .other
                     assets.append(DetectedAsset(
                         rawLabel: COCOAssetCatalog.displayName(for: top.identifier),

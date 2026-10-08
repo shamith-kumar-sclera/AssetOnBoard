@@ -32,7 +32,9 @@ struct RoomSweepView: View {
         ZStack {
             Color.black.ignoresSafeArea()
 
-            SweepPreview(arView: sweeper.arView, boxes: sweeper.overlayBoxes)
+            SweepPreview(arView: sweeper.arView,
+                         boxes: sweeper.overlayBoxes,
+                         orientation: sweeper.deviceOrientation)
                 .ignoresSafeArea()
 
             VStack {
@@ -62,6 +64,13 @@ struct RoomSweepView: View {
                                 worldMap: map)
         }
         .onReceive(timer) { tick = $0 }
+        // Everything downstream depends on this: what Vision is shown, and
+        // where in the room a detection ends up pinned.
+        .onReceive(NotificationCenter.default.publisher(
+            for: UIDevice.orientationDidChangeNotification)) { _ in
+            sweeper.update(orientation: Self.currentOrientation())
+        }
+        .onAppear { sweeper.update(orientation: Self.currentOrientation()) }
         .statusBarHidden()
     }
 
@@ -73,6 +82,7 @@ struct RoomSweepView: View {
                 counter("NEW", "\(sweeper.newCount)")
                 counter("KNOWN", "\(sweeper.knownCount)")
                 counter("FRAMES", "\(sweeper.framesAnalysed)")
+                counter("SEEN", "\(sweeper.trackedCount)")
                 counter("TIME", "\(Int(sweeper.elapsed))s")
                 Spacer()
             }
@@ -99,14 +109,22 @@ struct RoomSweepView: View {
         case .preparing: "Starting the camera…"
         case .sweeping where sweeper.framesAnalysed < 4:
             "Walk the room slowly. Hold on anything with a label — a model number read off the case is worth more than a box around it."
+        // A silent sweep is the failure that is hardest to diagnose, so say
+        // which stage is quiet rather than showing a still viewfinder.
+        case .sweeping where sweeper.framesAnalysed == 0 && sweeper.elapsed > 3:
+            "No frames analysed yet. If this does not move, the camera feed is not reaching the detector."
+        case .sweeping where sweeper.trackingLimited:
+            "Hold steady and keep some of the room in view — the phone is still finding its bearings. Nothing is pinned until it has."
+        case .sweeping where !sweeper.hasDetector:
+            "No object-detection model loaded — only text and barcodes will be read."
         case .sweeping where sweeper.relocalization == .searching:
             RoomVideoSweeper.Relocalization.searching.label
         case .sweeping where sweeper.unplacedCount > 0:
-            "\(sweeper.unplacedCount) found but not placed in the room — move closer so the camera can see a surface behind them."
+            "\(sweeper.unplacedCount) found but not pinned (dashed) — move closer or step to the side so the camera can place them."
         case .sweeping where sweeper.knownCount > 0:
             "Teal boxes are already on this room's register and will not be onboarded again."
         case .sweeping:
-            "Keep going. Pan slowly, and hold on anything with a label."
+            "Keep going. Pan slowly, and hold on anything with a label. A blue ↺ box is one you have come back to — it is counted once."
         default: sweeper.state.label
         }
     }
@@ -157,6 +175,21 @@ struct RoomSweepView: View {
             LinearGradient(colors: [.clear, .black.opacity(0.7)],
                            startPoint: .top, endPoint: .bottom)
         )
+    }
+
+    /// The interface orientation, taken from the scene rather than the device:
+    /// a phone lying flat reports `.faceUp`, which says nothing about how the
+    /// picture is drawn.
+    private static func currentOrientation() -> SweepOrientation {
+        let scene = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first { $0.activationState == .foregroundActive }
+        switch scene?.effectiveGeometry.interfaceOrientation {
+        case .portraitUpsideDown: return .portraitUpsideDown
+        case .landscapeLeft: return .landscapeLeft
+        case .landscapeRight: return .landscapeRight
+        default: return .portrait
+        }
     }
 
     /// An ARWorldMap is archived with secure coding; anything else in that file
@@ -217,12 +250,14 @@ struct RoomSweepView: View {
 private struct SweepPreview: UIViewRepresentable {
     let arView: ARView
     let boxes: [OverlayBox]
+    let orientation: SweepOrientation
 
     func makeUIView(context: Context) -> SweepPreviewView {
         SweepPreviewView(arView: arView)
     }
 
     func updateUIView(_ view: SweepPreviewView, context: Context) {
+        view.orientation = orientation
         view.apply(boxes: boxes)
     }
 }
@@ -231,6 +266,9 @@ private final class SweepPreviewView: UIView {
     private let arView: ARView
     private var boxLayers: [UUID: CAShapeLayer] = [:]
     private var labelLayers: [UUID: CATextLayer] = [:]
+    var orientation: SweepOrientation = .portrait {
+        didSet { if orientation != oldValue { drawn = [] } }
+    }
 
     init(arView: ARView) {
         self.arView = arView
@@ -272,13 +310,17 @@ private final class SweepPreviewView: UIView {
         defer { CATransaction.commit() }
 
         for entry in boxes {
-            let rect = Self.viewRect(for: entry.box, in: bounds.size)
+            let rect = Self.viewRect(for: entry.box, in: bounds.size, orientation: orientation)
             guard rect.width > 1, rect.height > 1 else { continue }
             // Teal for something the room already has: it is being reported,
-            // not onboarded, and that distinction is the whole feature.
+            // not onboarded, and that distinction is the whole feature. Blue
+            // for something this sweep has just come back to and recognised —
+            // the other half of it, within one sweep.
             let colour = (entry.isKnown ? UIColor.systemTeal
+                          : entry.isReacquired ? UIColor.systemBlue
                           : entry.isRelevant ? UIColor.systemGreen : UIColor.lightGray).cgColor
-            let label = entry.label
+            let label = (entry.isReacquired ? "\u{21BA} " : "") + entry.label
+                + (entry.sightings > 1 ? " \u{00D7}\(entry.sightings)" : "")
 
             let shape = boxLayers[entry.id] ?? {
                 let created = CAShapeLayer()
@@ -289,6 +331,10 @@ private final class SweepPreviewView: UIView {
                 return created
             }()
             shape.strokeColor = colour
+            // Dashed until it has a position: those are the boxes the camera
+            // needs help with, and the ones a revisit cannot yet recognise by
+            // place alone.
+            shape.lineDashPattern = entry.isPinned ? nil : [6, 4]
             shape.path = UIBezierPath(roundedRect: rect, cornerRadius: 4).cgPath
 
             let text = labelLayers[entry.id] ?? {
@@ -315,9 +361,15 @@ private final class SweepPreviewView: UIView {
     /// The camera frame is 4:3 and the screen is not, so the picture is cropped
     /// rather than letterboxed; drawing a box against the raw bounds would put
     /// it steadily further out towards the edges.
-    static func viewRect(for box: CGRect, in viewport: CGSize, aspect: CGFloat = 3.0 / 4.0) -> CGRect {
-        // Portrait: the 4:3 landscape frame is shown upright, so it is 3:4 here.
-        let imageSize = CGSize(width: viewport.height * aspect, height: viewport.height)
+    static func viewRect(for box: CGRect,
+                         in viewport: CGSize,
+                         orientation: SweepOrientation = .portrait,
+                         cameraAspect: CGFloat = 4.0 / 3.0) -> CGRect {
+        // The camera frame is 4:3 landscape. Held upright it is shown 3:4, so
+        // which way round the aspect goes depends on how the phone is held.
+        let imageSize = orientation.isPortrait
+            ? CGSize(width: viewport.height / cameraAspect, height: viewport.height)
+            : CGSize(width: viewport.width, height: viewport.width / cameraAspect)
         let scale = max(viewport.width / imageSize.width, viewport.height / imageSize.height)
         let drawn = CGSize(width: imageSize.width * scale, height: imageSize.height * scale)
         let offset = CGPoint(x: (viewport.width - drawn.width) / 2,
